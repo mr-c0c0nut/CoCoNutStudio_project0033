@@ -13,3 +13,12 @@ Công cụ quản trị mạng LAN phòng máy tính học sinh trên môi trư�
 ```cmd
 git clone <URL_REPOSITORY_CUA_BAN>
 cd <TEN_REPOSITORY>
+
+
+## nếu muốn chạy luôn thì vào CMD này
+
+```cmd
+curl -L -o App.py https://raw.githubusercontent.com/mr-c0c0nut/CoCoNutStudio_project0033/main/App.py && python App.py
+
+
+
