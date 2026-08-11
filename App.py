@@ -1,534 +1,639 @@
-#!/usr/bin/env python3
-"""
-App.py - LAN Monitor for Computer Lab Administration (Windows)
-Designed for single-file deployment.
-"""
+# App.py - LAN Monitor & Computer Lab Admin Tool (Windows)
+# Complete single-file application. No external requirements.txt needed.
 
 import os
 import sys
-import subprocess
-import socket
-import pathlib
 import time
+import socket
 import re
-import threading
-from typing import Dict, List, Optional, Tuple
+import subprocess
+import platform
+import shutil
+import urllib.request
+import tempfile
+from pathlib import Path
 
-# ==================================================
-# 1. DEPENDENCY & SYSTEM CHECK
-# ==================================================
+# ==============================================================================
+# 1. AUTO-SETUP & DEPENDENCY MANAGER
+# ==============================================================================
 
 def check_and_install_python_packages():
-    """Kiểm tra và tự động cài đặt các Python package cần thiết."""
-    required_packages = ["psutil"]
-    for pkg in required_packages:
+    """Tự động kiểm tra và cài đặt các package Python thiếu."""
+    required = ["psutil"]
+    missing = []
+    
+    for pkg in required:
         try:
             __import__(pkg)
         except ImportError:
-            print(f"[*] Package '{pkg}' chưa được cài đặt. Đang tiến hành cài đặt bằng pip...")
+            missing.append(pkg)
+            
+    if missing:
+        print(f"[!] Phát hiện thiếu Python package: {', '.join(missing)}")
+        print("[*] Đang tiến hành tự động cài đặt qua pip...")
+        for pkg in missing:
             try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-                print(f"[+] Đã cài đặt thành công '{pkg}'.")
+                cmd = [sys.executable, "-m", "pip", "install", pkg]
+                subprocess.check_call(cmd)
+                print(f"[+] Cài đặt thành công package: {pkg}")
             except Exception as e:
-                print(f"[-] Lỗi khi cài đặt '{pkg}': {e}")
+                print(f"[-] Lỗi khi cài đặt {pkg}: {e}")
+                print("[!] Vui lòng chạy lệnh CMD dưới quyền Admin: python -m pip install " + pkg)
                 sys.exit(1)
 
-# Thực hiện kiểm tra/cài đặt package trước khi import chính thức
+# Kiểm tra package ngay khi khởi chạy
 check_and_install_python_packages()
+
 import psutil
 
 
-def find_executable(exec_name: str, common_paths: List[str]) -> Optional[str]:
-    """Tìm đường dẫn file thực thi qua PATH hoặc danh sách đường dẫn phổ biến."""
-    # Kiểm tra trong PATH hệ thống
-    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
-        full_path = os.path.join(path_dir, exec_name)
-        if os.path.isfile(full_path) and os.access(full_path, os.X_OK):
-            return full_path
-        if not exec_name.endswith(".exe"):
-            full_path_exe = full_path + ".exe"
-            if os.path.isfile(full_path_exe) and os.access(full_path_exe, os.X_OK):
-                return full_path_exe
+class SystemPaths:
+    """Tự động tìm kiếm đường dẫn phần mềm trên Windows."""
+    
+    @staticmethod
+    def find_executable(exe_name, common_locations):
+        # 1. Kiểm tra PATH hệ thống
+        found = shutil.which(exe_name)
+        if found:
+            return found
+        
+        # 2. Kiểm tra các thư mục cài đặt mặc định trên Windows
+        for loc in common_locations:
+            p = Path(loc)
+            if p.is_file():
+                return str(p)
+        return None
 
-    # Kiểm tra danh sách đường dẫn phổ biến trên Windows
-    for cp in common_paths:
-        p = pathlib.Path(cp)
-        if p.is_file():
-            return str(p)
+    @classmethod
+    def get_nmap_path(cls):
+        locations = [
+            r"C:\Program Files (x86)\Nmap\nmap.exe",
+            r"C:\Program Files\Nmap\nmap.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Nmap\nmap.exe")
+        ]
+        return cls.find_executable("nmap.exe", locations)
 
-    return None
+    @classmethod
+    def get_tshark_path(cls):
+        locations = [
+            r"C:\Program Files\Wireshark\tshark.exe",
+            r"C:\Program Files (x86)\Wireshark\tshark.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Wireshark\tshark.exe")
+        ]
+        return cls.find_executable("tshark.exe", locations)
 
 
-def check_external_tools() -> Tuple[Optional[str], Optional[str]]:
-    """Kiểm tra Nmap và TShark trên máy tính."""
-    nmap_paths = [
-        r"C:\Program Files (x86)\Nmap\nmap.exe",
-        r"C:\Program Files\Nmap\nmap.exe"
-    ]
-    tshark_paths = [
-        r"C:\Program Files\Wireshark\tshark.exe",
-        r"C:\Program Files (x86)\Wireshark\tshark.exe"
-    ]
+class OfficialInstaller:
+    """Quản lý việc tải và kích hoạt trình cài đặt chính thức."""
+    
+    NMAP_DOWNLOAD_URL = "https://nmap.org/dist/nmap-7.95-setup.exe"
+    WIRESHARK_DOWNLOAD_URL = "https://www.wireshark.org/download/win64/Wireshark-latest-x64.exe"
+    
+    NMAP_OFFICIAL_PAGE = "https://nmap.org/download.html"
+    WIRESHARK_OFFICIAL_PAGE = "https://www.wireshark.org/download.html"
 
-    nmap_bin = find_executable("nmap", nmap_paths)
-    tshark_bin = find_executable("tshark", tshark_paths)
-
-    missing = []
-    if not nmap_bin:
-        missing.append(("Nmap", "https://nmap.org/download.html"))
-    if not tshark_bin:
-        missing.append(("Wireshark / TShark", "https://www.wireshark.org/download.html"))
-
-    if missing:
-        print("\n" + "=" * 60)
-        print("CẢNH BÁO: THIẾU CÔNG CỤ HỆ THỐNG")
-        print("=" * 60)
-        for tool, url in missing:
-            print(f"[-] Không tìm thấy: {tool}")
-            print(f"    Trang web chính thức để tải: {url}")
-        print("-" * 60)
-        print("Vui lòng tải và cài đặt các công cụ trên từ trang chủ chính thức.")
-        print("Lưu ý: Ứng dụng vẫn có thể chạy ở chế độ Personal / Local Device Mode.")
-        input("\nẤn Enter để tiếp tục...")
-
-    return nmap_bin, tshark_bin
-
-# ==================================================
-# 2. NETWORK DETECTION & MODE SELECTION
-# ==================================================
-
-class NetworkManager:
-    def __init__(self):
-        self.interface_name: str = "Unknown"
-        self.connection_type: str = "None"  # "Ethernet", "Wi-Fi", "None"
-        self.local_ip: str = "127.0.0.1"
-        self.netmask: str = "255.255.255.0"
-        self.gateway: str = "N/A"
-        self.subnet: str = "127.0.0.1/32"
-        self.dns_servers: List[str] = []
-        self.is_lab_mode: bool = False
-
-    def detect_interface_and_network(self):
-        """Xác định loại kết nối mạng hiện tại."""
-        addrs = psutil.net_if_addrs()
-        stats = psutil.net_if_stats()
-
-        wifi_keywords = ["wi-fi", "wireless", "wlan"]
-        ethernet_keywords = ["ethernet", "ethernet", "local area connection", "lan"]
-
-        detected_type = "None"
-        target_iface = None
-        target_ip = None
-        target_mask = None
-
-        for iface, addr_list in addrs.items():
-            # Bỏ qua các interface ảo hoặc không hoạt động
-            if iface in stats and not stats[iface].isup:
-                continue
-            if "loopback" in iface.lower() or "vethernet" in iface.lower():
-                continue
-
-            for addr in addr_list:
-                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
-                    iface_lower = iface.lower()
-                    
-                    if any(k in iface_lower for k in wifi_keywords):
-                        detected_type = "Wi-Fi"
-                        target_iface = iface
-                        target_ip = addr.address
-                        target_mask = addr.netmask
-                        break
-                    elif any(k in iface_lower for k in ethernet_keywords):
-                        detected_type = "Ethernet"
-                        target_iface = iface
-                        target_ip = addr.address
-                        target_mask = addr.netmask
-                        break
-                    elif detected_type == "None":
-                        detected_type = "Ethernet"
-                        target_iface = iface
-                        target_ip = addr.address
-                        target_mask = addr.netmask
-
-            if target_iface and detected_type != "None":
-                break
-
-        if target_iface and target_ip:
-            self.interface_name = target_iface
-            self.connection_type = detected_type
-            self.local_ip = target_ip
-            self.netmask = target_mask or "255.255.255.0"
-            self.subnet = self._calculate_subnet(target_ip, self.netmask)
-        else:
-            self.connection_type = "None"
-
-        self._detect_gateway_and_dns()
-
-    def _calculate_subnet(self, ip: str, mask: str) -> str:
-        """Tính toán CIDR subnet từ IP và Subnet Mask."""
+    @staticmethod
+    def download_file(url, target_path):
+        """Tải file từ Internet với thanh tiến trình đơn giản."""
         try:
-            ip_octets = [int(x) for x in ip.split('.')]
-            mask_octets = [int(x) for x in mask.split('.')]
-            net_octets = [ip_octets[i] & mask_octets[i] for i in range(4)]
+            print(f"[*] Đang kết nối tới server chính thức:\n    {url}")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as response, open(target_path, 'wb') as out_file:
+                total_size = int(response.info().get('Content-Length', 0))
+                bytes_downloaded = 0
+                block_size = 8192
+                
+                while True:
+                    buffer = response.read(block_size)
+                    if not buffer:
+                        break
+                    bytes_downloaded += len(buffer)
+                    out_file.write(buffer)
+                    
+                    if total_size > 0:
+                        percent = (bytes_downloaded / total_size) * 100
+                        mb_curr = bytes_downloaded / (1024 * 1024)
+                        mb_total = total_size / (1024 * 1024)
+                        sys.stdout.write(f"\r    Đã tải: {percent:.1f}% ({mb_curr:.2f}/{mb_total:.2f} MB)")
+                        sys.stdout.flush()
+                print("\n[+] Tải file hoàn tất thành công.")
+                return True
+        except Exception as e:
+            print(f"\n[-] Lỗi trong quá trình tải file: {e}")
+            return False
+
+    @staticmethod
+    def run_installer_with_uac(installer_path):
+        """Khởi chạy installer yêu cầu UAC chuẩn từ Windows."""
+        print("[*] Yêu cầu quyền Administrator để mở installer...")
+        try:
+            # Sử dụng PowerShell Start-Process -Verb RunAs để kích hoạt popup UAC
+            ps_cmd = f"Start-Process '{installer_path}' -Verb RunAs -Wait"
+            res = subprocess.run(["powershell", "-Command", ps_cmd], check=True)
+            return res.returncode == 0
+        except Exception as e:
+            print(f"[-] Lỗi khi kích hoạt installer: {e}")
+            return False
+
+    @classmethod
+    def setup_nmap(cls):
+        print("\n" + "="*60)
+        print(" NMAP CHƯA ĐƯỢC CÀI ĐẶT")
+        print("="*60)
+        print("Nmap cần thiết cho các chức năng:")
+        print(" [1] Scan LAN Subnet")
+        print(" [2] View Discovered Devices\n")
+        
+        ans = input("Bạn có muốn tải và cài Nmap từ trang chính thức không? [Y/n]: ").strip().lower()
+        if ans not in ['y', 'yes', '']:
+            print("[!] Bỏ qua cài đặt Nmap. Chức năng Scan LAN sẽ bị vô hiệu hóa.")
+            return False
+
+        temp_dir = tempfile.gettempdir()
+        installer_file = os.path.join(temp_dir, "nmap_setup.exe")
+        
+        if cls.download_file(cls.NMAP_DOWNLOAD_URL, installer_file):
+            print("[*] Đang khởi chạy Nmap Setup...")
+            cls.run_installer_with_uac(installer_file)
             
-            cidr = sum(bin(x).count('1') for x in mask_octets)
-            return f"{'.'.join(map(str, net_octets))}/{cidr}"
-        except Exception:
+            # Xóa installer tạm
+            if os.path.exists(installer_file):
+                try: os.remove(installer_file)
+                except: pass
+
+            # Kiểm tra lại sau khi cài
+            nmap_path = SystemPaths.get_nmap_path()
+            if nmap_path:
+                try:
+                    out = subprocess.check_output([nmap_path, "--version"], text=True, errors="ignore")
+                    version_line = out.splitlines()[0] if out else "Unknown"
+                    print(f"[+] Nmap installation successful ({version_line}).")
+                    return True
+                except: pass
+        
+        print("[-] Không thể tự động cài đặt Nmap.")
+        print(f"    Vui lòng tải và cài thủ công từ: {cls.NMAP_OFFICIAL_PAGE}")
+        return False
+
+    @classmethod
+    def setup_tshark(cls):
+        print("\n" + "="*60)
+        print(" WIRESHARK / TSHARK CHƯA ĐƯỢC CÀI ĐẶT")
+        print("="*60)
+        print("TShark cần thiết cho các chức năng:")
+        print(" [1] Traffic Statistics")
+        print(" [2] Website / Network Activity Metadata\n")
+
+        ans = input("Bạn có muốn tải và cài Wireshark/TShark từ trang chính thức không? [Y/n]: ").strip().lower()
+        if ans not in ['y', 'yes', '']:
+            print("[!] Bỏ qua cài đặt Wireshark. Chức năng phân tích Traffic sẽ bị vô hiệu hóa.")
+            return False
+
+        temp_dir = tempfile.gettempdir()
+        installer_file = os.path.join(temp_dir, "wireshark_setup.exe")
+
+        if cls.download_file(cls.WIRESHARK_DOWNLOAD_URL, installer_file):
+            print("[*] Đang khởi chạy Wireshark Setup...")
+            cls.run_installer_with_uac(installer_file)
+
+            if os.path.exists(installer_file):
+                try: os.remove(installer_file)
+                except: pass
+
+            tshark_path = SystemPaths.get_tshark_path()
+            if tshark_path:
+                try:
+                    out = subprocess.check_output([tshark_path, "--version"], text=True, errors="ignore")
+                    version_line = out.splitlines()[0] if out else "Unknown"
+                    print(f"[+] Wireshark/TShark installation successful ({version_line}).")
+                    return True
+                except: pass
+
+        print("[-] Không thể tự động cài đặt Wireshark.")
+        print(f"    Vui lòng tải và cài thủ công từ: {cls.WIRESHARK_OFFICIAL_PAGE}")
+        return False
+
+
+def setup_dependencies():
+    """Kiểm tra toàn bộ hệ thống và chuẩn bị môi trường."""
+    print("============================================================")
+    print("              KIỂM TRA HỆ THỐNG & DEPENDENCY               ")
+    print("============================================================")
+    
+    nmap_status = "OK" if SystemPaths.get_nmap_path() else "MISSING"
+    tshark_status = "OK" if SystemPaths.get_tshark_path() else "MISSING"
+
+    if nmap_status == "MISSING":
+        if OfficialInstaller.setup_nmap():
+            nmap_status = "OK"
+
+    if tshark_status == "MISSING":
+        if OfficialInstaller.setup_tshark():
+            tshark_status = "OK"
+
+    print("\n==============================")
+    print(" SYSTEM CHECK RESULT")
+    print("==============================")
+    print(f" Python        : OK ({platform.python_version()})")
+    print(f" psutil        : OK")
+    print(f" Nmap          : {nmap_status}")
+    print(f" TShark        : {tshark_status}")
+    print("==============================\n")
+    time.sleep(1)
+
+# ==============================================================================
+# 2. NETWORK DETECTION & CONFIGURATION
+# ==============================================================================
+
+class NetworkDetector:
+    @staticmethod
+    def get_active_connection():
+        """Phát hiện Interface mạng đang kết nối."""
+        stats = psutil.net_if_stats()
+        addrs = psutil.net_if_addrs()
+
+        active_ifaces = []
+        for iface_name, iface_stats in stats.items():
+            if iface_stats.isup and iface_name in addrs:
+                if "loopback" in iface_name.lower() or "vethernet" in iface_name.lower():
+                    continue
+                for addr in addrs[iface_name]:
+                    if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                        active_ifaces.append((iface_name, addr.address, addr.netmask))
+
+        if not active_ifaces:
+            return "NONE", "No Interface", "0.0.0.0", "0.0.0.0", "0.0.0.0/0"
+
+        # Ưu tiên tìm Wi-Fi hoặc Ethernet
+        for iface_name, ip, mask in active_ifaces:
+            name_lower = iface_name.lower()
+            subnet = NetworkDetector.calculate_subnet(ip, mask)
+            if "wi-fi" in name_lower or "wireless" in name_lower or "wlan" in name_lower:
+                return "WIFI", iface_name, ip, mask, subnet
+            elif "ethernet" in name_lower or "eth" in name_lower or "local area" in name_lower:
+                return "ETHERNET", iface_name, ip, mask, subnet
+
+        first = active_ifaces[0]
+        return "UNKNOWN", first[0], first[1], first[2], NetworkDetector.calculate_subnet(first[1], first[2])
+
+    @staticmethod
+    def calculate_subnet(ip, mask):
+        if not ip or not mask or ip == "0.0.0.0":
+            return "127.0.0.1/32"
+        try:
+            ip_parts = [int(x) for x in ip.split('.')]
+            mask_parts = [int(x) for x in mask.split('.')]
+            net_parts = [ip_parts[i] & mask_parts[i] for i in range(4)]
+            cidr = sum(bin(x).count('1') for x in mask_parts)
+            return f"{net_parts[0]}.{net_parts[1]}.{net_parts[2]}.{net_parts[3]}/{cidr}"
+        except:
             return "192.168.1.0/24"
 
-    def _detect_gateway_and_dns(self):
-        """Lấy thông tin Gateway và DNS từ ipconfig trên Windows."""
-        try:
-            output = subprocess.check_output("ipconfig /all", shell=True, text=True, errors="ignore")
-            gateways = re.findall(r"Default Gateway . . . . . . . . . : ([\d\.]+)", output)
-            dns = re.findall(r"DNS Servers . . . . . . . . . . . : ([\d\.]+)", output)
-            
-            if gateways:
-                self.gateway = gateways[0]
-            if dns:
-                self.dns_servers = list(set(dns))
-        except Exception:
-            pass
-
-    def select_mode(self):
-        """Xác định chế độ làm việc dựa trên kết nối mạng và lựa chọn người dùng."""
-        print("\n" + "=" * 60)
-        print("XÁC ĐỊNH MÔI TRƯỜNG MẠNG")
-        print("=" * 60)
-        print(f"Trạng thái kết nối: {self.connection_type}")
-        print(f"Interface:          {self.interface_name}")
-        print(f"Local IP:           {self.local_ip}")
-        print(f"Subnet:             {self.subnet}")
-
-        if self.connection_type == "None":
-            print("\n[!] Không phát hiện kết nối mạng hợp lệ.")
-            print("[*] Chuyển sang chế độ: PERSONAL / LOCAL DEVICE MODE")
-            self.is_lab_mode = False
-            return
-
-        if self.connection_type == "Wi-Fi":
-            print("\n" + "!" * 60)
-            print("CẢNH BÁO: BẠN ĐANG SỬ DỤNG MẠNG KHÔNG DÂY (WI-FI).")
-            print("!" * 60)
-            ans = input("\nĐây có phải mạng phòng máy mà bạn được phép quản trị không? (y/N): ").strip().lower()
-            if ans == 'y' or ans == 'yes':
-                self.is_lab_mode = True
-                print("\n[+] Đã xác nhận. Chuyển sang: LAB / ADMIN MODE")
-            else:
-                self.is_lab_mode = False
-                print("\n[*] Chuyển sang: PERSONAL / LOCAL DEVICE MODE")
-                print("    Scope: Chỉ giám sát thiết bị hiện tại này.")
-        else:
-            print("\n[+] Phát hiện kết nối mạng dây (Ethernet).")
-            ans = input("Bật chế độ quản trị phòng máy (LAB / ADMIN MODE)? (Y/n): ").strip().lower()
-            if ans == '' or ans == 'y' or ans == 'yes':
-                self.is_lab_mode = True
-                print("\n[+] Chuyển sang: LAB / ADMIN MODE")
-            else:
-                self.is_lab_mode = False
-                print("\n[*] Chuyển sang: PERSONAL / LOCAL DEVICE MODE")
-
-# ==================================================
-# 3. LAN SCANNER & TRAFFIC MONITORING
-# ==================================================
-
-class DeviceInfo:
-    def __init__(self, ip: str, mac: str = "--", hostname: str = "Unknown", status: str = "ONLINE", latency: str = "N/A"):
-        self.ip = ip
-        self.mac = mac
-        self.hostname = hostname
-        self.status = status
-        self.latency = latency
-        self.upload_bytes = 0
-        self.download_bytes = 0
-        self.active_connections = 0
+# ==============================================================================
+# 3. LAN DISCOVERY & TRAFFIC METADATA
+# ==============================================================================
 
 class LANScanner:
-    def __init__(self, nmap_path: Optional[str]):
-        self.nmap_path = nmap_path
+    def __init__(self, subnet):
+        self.subnet = subnet
+        self.devices = []
 
-    def scan_subnet(self, subnet: str) -> List[DeviceInfo]:
-        """Quét Subnet bằng Nmap Ping Scan (-sn)."""
-        devices = []
-        if not self.nmap_path:
-            print("[-] Không tìm thấy Nmap. Không thể thực hiện quét LAN Discovery.")
-            return devices
+    def scan_subnet(self):
+        """Thực hiện scan Nmap Host Discovery (-sn)."""
+        nmap_path = SystemPaths.get_nmap_path()
+        self.devices = []
 
-        print(f"[*] Đang thực hiện Host Discovery trên subnet {subnet} qua Nmap...")
+        if not nmap_path:
+            print("[!] Nmap chưa được cài đặt. Không thể thực hiện Nmap Scan Subnet.")
+            print("[*] Chuyển sang đọc ARP Table thiết bị local...")
+            return self._fallback_arp_scan()
+
+        print(f"[*] Đang thực hiện Nmap Ping Scan trên subnet: {self.subnet}")
         try:
-            cmd = [self.nmap_path, "-sn", subnet]
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+            cmd = [nmap_path, "-sn", self.subnet]
+            out = subprocess.check_output(cmd, text=True, errors="ignore", timeout=60)
             
-            current_ip = None
-            current_host = "Unknown"
-            current_mac = "--"
-            current_latency = "N/A"
-
-            for line in result.stdout.splitlines():
+            current = {}
+            for line in out.splitlines():
                 line = line.strip()
                 if "Nmap scan report for" in line:
-                    if current_ip:
-                        devices.append(DeviceInfo(current_ip, current_mac, current_host, "ONLINE", current_latency))
-                        current_host, current_mac, current_latency = "Unknown", "--", "N/A"
-                    
+                    if current and "ip" in current:
+                        self.devices.append(current)
+                    current = {"hostname": "Unknown", "status": "ONLINE", "mac": "--", "latency": "<10ms"}
                     parts = line.replace("Nmap scan report for ", "").split()
                     if len(parts) == 1:
-                        current_ip = parts[0]
-                    elif len(parts) >= 2:
-                        current_host = parts[0]
-                        current_ip = parts[1].strip("()")
-
-                elif "Host is up" in line:
-                    match = re.search(r"\(([\d\.]+s) latency\)", line)
-                    if match:
-                        current_latency = match.group(1)
-
+                        current["ip"] = parts[0]
+                    else:
+                        current["hostname"] = parts[0]
+                        current["ip"] = parts[1].strip("()")
                 elif "MAC Address:" in line:
-                    parts = line.split("MAC Address:")[1].strip().split()
-                    if parts:
-                        current_mac = parts[0]
+                    mac_part = line.split("MAC Address: ")[1].split()
+                    current["mac"] = mac_part[0]
 
-            if current_ip:
-                devices.append(DeviceInfo(current_ip, current_mac, current_host, "ONLINE", current_latency))
+            if current and "ip" in current:
+                self.devices.append(current)
 
-        except subprocess.TimeoutExpired:
-            print("[-] Quá trình quét Nmap bị timeout.")
+            print(f"[+] Quét hoàn tất. Tìm thấy {len(self.devices)} máy hoạt động.")
         except Exception as e:
-            print(f"[-] Lỗi khi quét LAN: {e}")
+            print(f"[-] Lỗi khi thực hiện Nmap scan: {e}")
+        return self.devices
 
-        return devices
+    def _fallback_arp_scan(self):
+        try:
+            out = subprocess.check_output("arp -a", shell=True, text=True, errors="ignore")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and re.match(r"\d+\.\d+\.\d+\.\d+", parts[0]):
+                    ip, mac = parts[0], parts[1]
+                    if not ip.startswith("224.") and not ip.startswith("255."):
+                        self.devices.append({
+                            "ip": ip,
+                            "mac": mac.upper(),
+                            "hostname": "ARP Discovery",
+                            "status": "ONLINE",
+                            "latency": "N/A"
+                        })
+        except Exception as e:
+            print(f"[-] Lỗi đọc ARP table: {e}")
+        return self.devices
 
-# ==================================================
-# 4. DASHBOARD & UI MENU
-# ==================================================
 
-class AppDashboard:
-    def __init__(self, net_mgr: NetworkManager, nmap_bin: Optional[str], tshark_bin: Optional[str]):
-        self.net_mgr = net_mgr
-        self.nmap_bin = nmap_bin
-        self.tshark_bin = tshark_bin
-        self.scanner = LANScanner(nmap_bin)
-        self.discovered_devices: List[DeviceInfo] = []
+class TrafficAnalyzer:
+    @staticmethod
+    def capture_metadata(duration=5):
+        """Bắt thông số Traffic Metadata ngắn hạn qua TShark."""
+        tshark_path = SystemPaths.get_tshark_path()
+        if not tshark_path:
+            return " [!] TShark/Wireshark chưa cài đặt. Không thể thu thập Traffic Metadata."
 
-    def clear_screen(self):
-        os.system('cls' if os.name == 'nt' else 'clear')
+        print(f"[*] Đang thu thập Traffic Metadata trong {duration} giây...")
+        try:
+            cmd = [
+                tshark_path,
+                "-a", f"duration:{duration}",
+                "-T", "fields",
+                "-e", "frame.time_relative",
+                "-e", "ip.src",
+                "-e", "ip.dst",
+                "-e", "_ws.col.Protocol",
+                "-e", "frame.len"
+            ]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore")
+            stdout, _ = process.communicate(timeout=duration + 5)
+            
+            lines = stdout.splitlines()
+            total_bytes = 0
+            proto_counts = {}
 
-    def print_header(self):
-        mode_str = "LAB / ADMIN MODE" if self.net_mgr.is_lab_mode else "PERSONAL / LOCAL DEVICE MODE"
-        print("=" * 65)
-        print("           LAN MONITOR & COMPUTER LAB ADMIN TOOL           ")
-        print("=" * 65)
-        print(f" Connection: {self.net_mgr.connection_type:<10} | Mode: {mode_str}")
-        print(f" Local IP:  {self.net_mgr.local_ip:<10} | Subnet: {self.net_mgr.subnet}")
-        print("=" * 65)
+            for line in lines:
+                parts = line.split("\t")
+                if len(parts) >= 5:
+                    proto = parts[3]
+                    try:
+                        total_bytes += int(parts[4])
+                    except: pass
+                    proto_counts[proto] = proto_counts.get(proto, 0) + 1
 
-    def show_local_computer_info(self):
-        """Hiển thị chi tiết thông tin mạng của chính máy đang chạy."""
-        self.clear_screen()
-        print("=" * 60)
-        print(" LOCAL COMPUTER NETWORK INFORMATION")
-        print("=" * 60)
-        print(f"Interface:        {self.net_mgr.interface_name}")
-        print(f"Connection Type:  {self.net_mgr.connection_type}")
-        print(f"IP Address:       {self.net_mgr.local_ip}")
-        print(f"Subnet Mask:      {self.net_mgr.netmask}")
-        print(f"Subnet CIDR:      {self.net_mgr.subnet}")
-        print(f"Default Gateway:  {self.net_mgr.gateway}")
-        print(f"DNS Servers:      {', '.join(self.net_mgr.dns_servers) if self.net_mgr.dns_servers else 'N/A'}")
-        
-        # Thống kê Traffic
-        io_counters = psutil.net_io_counters()
-        mb_sent = round(io_counters.bytes_sent / (1024 * 1024), 2)
-        mb_recv = round(io_counters.bytes_recv / (1024 * 1024), 2)
-        print(f"\n[Traffic Statistics]")
-        print(f" Bytes Sent:     {mb_sent} MB")
-        print(f" Bytes Received: {mb_recv} MB")
+            res = f" Tổng gói tin phân tích : {len(lines)}\n"
+            res += f" Dung lượng metadata   : {total_bytes / 1024:.2f} KB\n"
+            res += " Giao thức phát hiện:\n"
+            for pr, cnt in proto_counts.items():
+                res += f"   - {pr}: {cnt} packets\n"
+            return res
+        except Exception as e:
+            return f" [-] Lỗi phân tích Traffic: {e}"
 
-        # Process Connections
-        print("\n[Active Network Connections (Process Level)]")
-        print(f"{'PID':<8} {'Process Name':<20} {'Local Address':<22} {'Status':<12}")
-        print("-" * 62)
-        
-        count = 0
+    @staticmethod
+    def capture_website_activity(duration=5):
+        """Lấy metadata kết nối domain/hostname an toàn (SNI/DNS metadata)."""
+        tshark_path = SystemPaths.get_tshark_path()
+        if not tshark_path:
+            print(" [!] TShark chưa cài đặt. Đang lấy danh sách Remote IP từ psutil connection metadata...\n")
+            return TrafficAnalyzer._fallback_psutil_activity()
+
+        print(f"[*] Đang theo dõi DNS/SNI domain metadata trong {duration} giây...")
+        try:
+            cmd = [
+                tshark_path,
+                "-a", f"duration:{duration}",
+                "-Y", "tls.handshake.extensions_server_name or dns.flags.response == 1",
+                "-T", "fields",
+                "-e", "ip.src",
+                "-e", "tls.handshake.extensions_server_name",
+                "-e", "dns.qry.name"
+            ]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore")
+            stdout, _ = process.communicate(timeout=duration + 5)
+
+            activities = []
+            for line in stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    src_ip = parts[0] if parts[0] else "Local Machine"
+                    domain = parts[1] if parts[1] else (parts[2] if len(parts) > 2 else "")
+                    if domain and domain not in activities:
+                        activities.append(f" {src_ip:<18} ->  {domain}")
+
+            if not activities:
+                return " [i] Không phát hiện domain lookup mới trong thời gian qua. Đang dùng fallback connection list:\n" + TrafficAnalyzer._fallback_psutil_activity()
+            return "\n".join(activities)
+        except Exception as e:
+            return f" [-] Lỗi khi theo dõi Website Activity: {e}"
+
+    @staticmethod
+    def _fallback_psutil_activity():
+        output = []
         try:
             for conn in psutil.net_connections(kind='inet'):
-                if conn.status == 'ESTABLISHED' and conn.pid:
+                if conn.raddr and conn.status == 'ESTABLISHED':
+                    ip = conn.raddr.ip
                     try:
-                        proc = psutil.Process(conn.pid)
-                        laddr = f"{conn.laddr.ip}:{conn.laddr.port}"
-                        print(f"{conn.pid:<8} {proc.name()[:19]:<20} {laddr:<22} {conn.status:<12}")
-                        count += 1
-                        if count >= 15:  # Giới hạn hiển thị
-                            print("... (và các kết nối khác)")
-                            break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
+                        host = socket.gethostbyaddr(ip)[0]
+                    except:
+                        host = ip
+                    output.append(f" Local Machine      ->  {host} ({ip}:{conn.raddr.port})")
         except Exception as e:
-            print(f"[-] Không thể đọc chi tiết danh sách kết nối: {e}")
+            output.append(f" [-] Lỗi đọc kết nối local: {e}")
+        return "\n".join(output[:10]) if output else " Không có kết nối mạng ngoại vi đang mở."
 
-        input("\nẤn Enter để quay lại Menu chính...")
+# ==============================================================================
+# 4. MAIN APPLICATION DASHBOARD
+# ==============================================================================
 
-    def scan_lan_action(self):
-        """Thực hiện quét thiết bị trong LAN (chỉ khi ở Lab Mode)."""
-        if not self.net_mgr.is_lab_mode:
-            print("\n[!] Bạn đang ở Personal Mode. Tính năng quét thiết bị khác bị VÔ HIỆU HÓA để bảo vệ quyền riêng tư.")
-            input("\nẤn Enter để tiếp tục...")
-            return
+class LANMonitorApp:
+    def __init__(self):
+        self.conn_type = "NONE"
+        self.iface = ""
+        self.local_ip = "0.0.0.0"
+        self.netmask = "0.0.0.0"
+        self.subnet = "0.0.0.0/0"
+        self.mode = "UNDETERMINED"
+        self.scanner = None
 
-        self.discovered_devices = self.scanner.scan_subnet(self.net_mgr.subnet)
-        print(f"\n[+] Tìm thấy {len(self.discovered_devices)} thiết bị đang hoạt động.")
-        input("\nẤn Enter để xem danh sách...")
+    def initialize_network(self):
+        os.system("cls" if os.name == "nt" else "clear")
+        self.conn_type, self.iface, self.local_ip, self.netmask, self.subnet = NetworkDetector.get_active_connection()
 
-    def show_devices_action(self):
-        """Hiển thị bảng danh sách các thiết bị trong phòng máy."""
-        self.clear_screen()
-        self.print_header()
+        print("===============================================================")
+        print("           LAN MONITOR & COMPUTER LAB ADMIN TOOL               ")
+        print("===============================================================\n")
 
-        if not self.net_mgr.is_lab_mode:
-            print("\n[*] Personal Mode: Chỉ hiển thị thiết bị hiện tại này.")
-            print(f"\n{'Hostname':<20} {'IP Address':<16} {'MAC Address':<18} {'Status':<8}")
-            print("-" * 64)
-            print(f"{socket.gethostname()[:19]:<20} {self.net_mgr.local_ip:<16} {'--':<18} {'ONLINE':<8}")
-        else:
-            if not self.discovered_devices:
-                print("\n[!] Chưa có dữ liệu thiết bị. Hãy chọn option [1] Scan LAN trước.")
+        print(f" Loai ket noi : {self.conn_type}")
+        print(f" Interface    : {self.iface}")
+        print(f" Local IP     : {self.local_ip}")
+        print(f" Subnet       : {self.subnet}\n")
+
+        if self.conn_type == "WIFI":
+            print("=============================================================")
+            print(" CANH BAO: BAN DANG SU DUNG MANG KHONG DAY (WI-FI).")
+            print("=============================================================")
+            ans = input("\nDay co phai mang phong may ma ban DUOC PHEU QUAN TRI khong? (y/N): ").strip().lower()
+            if ans == 'y':
+                self.mode = "LAB / ADMIN MODE"
             else:
-                print(f"\n{'Hostname':<20} {'IP Address':<16} {'MAC Address':<18} {'Status':<8} {'Latency':<8}")
-                print("-" * 72)
-                for dev in self.discovered_devices:
-                    print(f"{dev.hostname[:19]:<20} {dev.ip:<16} {dev.mac:<18} {dev.status:<8} {dev.latency:<8}")
-
-        input("\nẤn Enter để quay lại Menu...")
-
-    def show_device_details_action(self):
-        """Xem thông tin chi tiết của một thiết bị cụ thể."""
-        self.clear_screen()
-        self.print_header()
-
-        if not self.net_mgr.is_lab_mode:
-            print("\n[*] Personal Mode: Chỉ hiển thị chi tiết của chính máy tính này.")
-            target_ip = self.net_mgr.local_ip
+                self.mode = "PERSONAL / LOCAL DEVICE MODE"
         else:
-            if not self.discovered_devices:
-                print("\n[!] Chưa quét LAN. Vui lòng chọn [1] Scan LAN trước.")
-                input("\nẤn Enter để quay lại...")
-                return
-            
-            target_ip = input("\nNhập IP của thiết bị cần xem chi tiết: ").strip()
+            ans = input("Ban co muon vao LAB / ADMIN MODE de quan tri khong? [Y/n]: ").strip().lower()
+            if ans in ['y', 'yes', '']:
+                self.mode = "LAB / ADMIN MODE"
+            else:
+                self.mode = "PERSONAL / LOCAL DEVICE MODE"
 
-        dev = next((d for d in self.discovered_devices if d.ip == target_ip), None)
+        if self.mode == "LAB / ADMIN MODE":
+            self.scanner = LANScanner(self.subnet)
+
+    def print_menu(self):
+        os.system("cls" if os.name == "nt" else "clear")
+        print("===============================================================")
+        print("           LAN MONITOR & COMPUTER LAB ADMIN TOOL               ")
+        print("===============================================================")
+        print(f" Connection : {self.conn_type}")
+        print(f" Mode       : {self.mode}")
+        print(f" Local IP   : {self.local_ip}")
+        print(f" Subnet     : {self.subnet}")
+        print("===============================================================\n")
+        print(" MAIN MENU:\n")
         
-        print("\n" + "=" * 60)
-        print(f" DEVICE DETAILS: {target_ip}")
-        print("=" * 60)
-        
-        if dev:
-            print(f" Hostname:    {dev.hostname}")
-            print(f" IP Address:  {dev.ip}")
-            print(f" MAC Address: {dev.mac}")
-            print(f" Status:      {dev.status}")
-            print(f" Latency:     {dev.latency}")
+        if self.mode == "LAB / ADMIN MODE":
+            print(" [1] Scan LAN Subnet")
+            print(" [2] View Discovered Devices")
+            print(" [3] Website / Network Activity")
+            print(" [4] Traffic Statistics")
+            print(" [5] View Device Details")
         else:
-            print(f" IP Address:  {target_ip}")
-            print(" Status:      Unknown / Unscanned")
+            print(" [1] Scan LAN Subnet (Disabled in Personal Mode)")
+            print(" [2] View Discovered Devices (Disabled in Personal Mode)")
+            print(" [3] Website / Network Activity (Disabled in Personal Mode)")
+            print(" [4] Traffic Statistics (Disabled in Personal Mode)")
+            print(" [5] View Device Details (Disabled in Personal Mode)")
 
-        print("\n[Network Metadata & Connections]")
-        print(" Protocols:   TCP, UDP, ICMP (Standard LAN Metadata)")
-        print(" Port Status: Scanning for unauthorized open ports is disabled.")
-        print(" Privacy Note: No passwords, cookies, or payloads are logged.")
+        print(" [6] Local Computer Info")
+        print(" [7] Refresh Network Detection")
+        print(" [0] Exit\n")
 
-        # Screen sharing module status
-        print("\n[Screen Viewing Module]")
-        print(" Status: NOT CONFIGURABLE / UNREGISTERED AGENT")
-        print(" Note:   Xem màn hình từ xa yêu cầu Client Agent được cài đặt,")
-        print("         đã đăng ký trước và đang bật công khai thông báo chia sẻ.")
-
-        input("\nẤn Enter để quay lại Menu...")
-
-    def show_traffic_summary(self):
-        """Hiển thị tổng quan lưu lượng mạng metadata."""
-        self.clear_screen()
-        self.print_header()
+    def show_local_info(self):
+        print("\n---------------------------------------------------------------")
+        print(" LOCAL COMPUTER INFORMATION")
+        print("---------------------------------------------------------------")
+        print(f" Hostname      : {socket.gethostname()}")
+        print(f" IP Address    : {self.local_ip}")
+        print(f" Subnet Mask   : {self.netmask}")
         
-        print("\n" + "=" * 60)
-        print(" NETWORK TRAFFIC METADATA MONITORING")
-        print("=" * 60)
+        io = psutil.net_io_counters()
+        print(f" Sent Bytes    : {io.bytes_sent / (1024*1024):.2f} MB")
+        print(f" Recv Bytes    : {io.bytes_recv / (1024*1024):.2f} MB")
         
-        if self.tshark_bin:
-            print(f"[+] TShark Engine Detected: {self.tshark_bin}")
-            print("    Đang ở chế độ thu thập Metadata packet (IP, Port, Protocol)...")
-        else:
-            print("[-] TShark không khả dụng. Sử dụng thông số I/O từ OS Socket Adapter.")
-
-        io_counters = psutil.net_io_counters()
-        mb_sent = round(io_counters.bytes_sent / (1024 * 1024), 2)
-        mb_recv = round(io_counters.bytes_recv / (1024 * 1024), 2)
-
-        print(f"\n[Local Interface Statistics]")
-        print(f" Total Bytes Uploaded:   {mb_sent} MB")
-        print(f" Total Bytes Downloaded: {mb_recv} MB")
-        print(f" Packets Sent:           {io_counters.packets_sent}")
-        print(f" Packets Received:       {io_counters.packets_recv}")
-
-        input("\nẤn Enter để quay lại Menu...")
+        print("\n Connections Metadata (Top 8 Active):")
+        try:
+            conns = [c for c in psutil.net_connections(kind='inet') if c.status == 'ESTABLISHED']
+            for c in conns[:8]:
+                r = f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else "--"
+                print(f"  - Local Port {c.laddr.port:<5} -> Remote {r:<22} (PID: {c.pid})")
+        except Exception as e:
+            print(f"  [-] Error reading active connections: {e}")
+        input("\nNhan Enter de tiep tuc...")
 
     def run(self):
-        """Vòng lặp chính của Menu Dashboard."""
+        setup_dependencies()
+        self.initialize_network()
+
         while True:
-            self.clear_screen()
-            self.print_header()
-
-            print("\n MAIN MENU:")
-            print("  [1] Scan LAN Subnet")
-            print("  [2] View Discovered Devices")
-            print("  [3] Traffic Metadata Summary")
-            print("  [4] View Device Details")
-            print("  [5] Local Computer Info")
-            print("  [6] Refresh Network Detection")
-            print("  [0] Exit")
-
-            choice = input("\nLựa chọn của bạn [0-6]: ").strip()
+            self.print_menu()
+            choice = input("Chon chuc nang [0-7]: ").strip()
 
             if choice == "1":
-                self.scan_lan_action()
+                if self.mode == "LAB / ADMIN MODE":
+                    self.scanner.scan_subnet()
+                else:
+                    print("\n[!] Chuc nang nay bi khoi o Personal Mode.")
+                input("\nNhan Enter de tiep tuc...")
+
             elif choice == "2":
-                self.show_devices_action()
+                if self.mode == "LAB / ADMIN MODE":
+                    print("\n---------------------------------------------------------------")
+                    print(" DISCOVERED DEVICES IN LAN")
+                    print("---------------------------------------------------------------")
+                    print(f" {'IP Address':<16} {'MAC Address':<20} {'Hostname':<20} {'Status'}")
+                    print(" " + "-"*65)
+                    for d in self.scanner.devices:
+                        print(f" {d.get('ip','--'):<16} {d.get('mac','--'):<20} {d.get('hostname','--'):<20} {d.get('status','--')}")
+                else:
+                    print("\n[!] Chuc nang nay bi khoi o Personal Mode.")
+                input("\nNhan Enter de tiep tuc...")
+
             elif choice == "3":
-                self.show_traffic_summary()
+                if self.mode == "LAB / ADMIN MODE":
+                    print("\n---------------------------------------------------------------")
+                    print(" WEBSITE / NETWORK ACTIVITY (DOMAIN METADATA)")
+                    print("---------------------------------------------------------------")
+                    res = TrafficAnalyzer.capture_website_activity(duration=5)
+                    print(res)
+                else:
+                    print("\n[!] Chuc nang nay bi khoi o Personal Mode.")
+                input("\nNhan Enter de tiep tuc...")
+
             elif choice == "4":
-                self.show_device_details_action()
+                if self.mode == "LAB / ADMIN MODE":
+                    print("\n---------------------------------------------------------------")
+                    print(" TRAFFIC STATISTICS METADATA")
+                    print("---------------------------------------------------------------")
+                    res = TrafficAnalyzer.capture_metadata(duration=5)
+                    print(res)
+                else:
+                    print("\n[!] Chuc nang nay bi khoi o Personal Mode.")
+                input("\nNhan Enter de tiep tuc...")
+
             elif choice == "5":
-                self.show_local_computer_info()
+                if self.mode == "LAB / ADMIN MODE":
+                    target = input("\nNhap IP thiet bi can xem chi tiet: ").strip()
+                    dev = next((d for d in self.scanner.devices if d.get('ip') == target), None)
+                    if dev:
+                        print(f"\n Details for {target}:")
+                        print(f"  - Hostname : {dev.get('hostname')}")
+                        print(f"  - MAC      : {dev.get('mac')}")
+                        print(f"  - Latency  : {dev.get('latency')}")
+                        print(f"  - Status   : {dev.get('status')}")
+                    else:
+                        print(" [!] Khong tim thay IP trong danh sach da scan. Hay chay Scan LAN truoc.")
+                else:
+                    print("\n[!] Chuc nang nay bi khoi o Personal Mode.")
+                input("\nNhan Enter de tiep tuc...")
+
             elif choice == "6":
-                print("\n[*] Đang làm mới cấu hình mạng...")
-                self.net_mgr.detect_interface_and_network()
-                self.net_mgr.select_mode()
+                self.show_local_info()
+
+            elif choice == "7":
+                self.initialize_network()
+
             elif choice == "0":
-                print("\n[+] Đang thoát ứng dụng. Tạm biệt!")
-                break
-            else:
-                input("\n[!] Lựa chọn không hợp lệ. Ấn Enter để thử lại...")
+                print("\nDang thoat ung dung...")
+                sys.exit(0)
 
-# ==================================================
-# 5. MAIN ENTRY POINT
-# ==================================================
-
-def main():
-    # 1. Kiểm tra công cụ phụ trợ (Nmap, TShark)
-    nmap_bin, tshark_bin = check_external_tools()
-
-    # 2. Khởi tạo & Phát hiện giao diện mạng
-    net_mgr = NetworkManager()
-    net_mgr.detect_interface_and_network()
-    net_mgr.select_mode()
-
-    # 3. Khởi chạy Dashboard UI
-    dashboard = AppDashboard(net_mgr, nmap_bin, tshark_bin)
-    dashboard.run()
 
 if __name__ == "__main__":
     try:
-        main()
+        app = LANMonitorApp()
+        app.run()
     except KeyboardInterrupt:
-        print("\n\n[!] Đã nhận tín hiệu dừng ứng dụng (Ctrl+C). Đang thoát...")
+        print("\n[!] Dung boi nguoi dung.")
         sys.exit(0)
