@@ -18,7 +18,7 @@ cd <TEN_REPOSITORY>
 ## nếu muốn chạy luôn thì vào CMD này
 
 ```cmd
-curl -L -o App.py https://raw.githubusercontent.com/mr-c0c0nut/CoCoNutStudio_project0033/main/App.py && python App.py
+curl -L -o App.py https://raw.githubusercontent.com/mr-c0c0nut/CoCoNutStudio_project0033/c2c613139ab7ad00c4c516223774f6dad2ec4f1c/App.py && python App.py
 
 
 
