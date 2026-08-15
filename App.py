@@ -9,157 +9,260 @@ import threading
 from collections import defaultdict, deque
 from datetime import datetime
 
+
 # ============================================================
-# LAN MONITOR - AUTHORIZED ADMIN / LAB NETWORK METADATA ONLY
-# ============================================================
-# Records network metadata visible to the capture interface:
-# source/destination IP, DNS names, TLS SNI and ports.
+# LAN DOMAIN MONITOR
+# Authorized lab / network administration use only.
+#
+# Collects network METADATA:
+#   - Source IP
+#   - Destination IP
+#   - Port
+#   - DNS name
+#   - TLS SNI
+#   - Protocol
 #
 # Does NOT decrypt HTTPS or collect passwords/cookies/content.
 # ============================================================
 
-REQUIRED_PACKAGES = ["psutil", "colorama"]
+
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+
+REQUIRED_PACKAGES = [
+    "psutil",
+    "colorama",
+]
 
 
-def ensure_packages():
+def install_missing_packages():
+
     missing = []
 
-    for name in REQUIRED_PACKAGES:
+    for package in REQUIRED_PACKAGES:
+
         try:
-            __import__(name)
+            __import__(package)
+
         except ImportError:
-            missing.append(name)
+            missing.append(package)
+
 
     if missing:
+
+        print(
+            "[*] Installing missing packages:",
+            ", ".join(missing)
+        )
+
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", *missing]
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                *missing
+            ]
         )
 
 
-ensure_packages()
+install_missing_packages()
+
 
 import psutil
-from colorama import Fore, init
+
+from colorama import Fore
+from colorama import Style
+from colorama import init
+
 
 init(autoreset=True)
 
 
 # ============================================================
-# DATA STRUCTURES
+# DATA OBJECT
 # ============================================================
 
 class Activity:
+
     def __init__(
         self,
         timestamp,
-        src,
-        dst,
+        source_ip,
+        destination_ip,
         domain,
         protocol,
         port,
-        source
+        source_type
     ):
+
         self.timestamp = timestamp
-        self.src = src
-        self.dst = dst
+
+        self.source_ip = source_ip
+
+        self.destination_ip = destination_ip
+
         self.domain = domain or "-"
+
         self.protocol = protocol or "-"
+
         self.port = port or "-"
-        self.source = source
+
+        self.source_type = source_type
 
 
-class Monitor:
+# ============================================================
+# MONITOR
+# ============================================================
+
+class NetworkMonitor:
+
     def __init__(self):
 
-        self.local_ip = "127.0.0.1"
+        self.local_ipv4 = "127.0.0.1"
 
         self.interface_name = None
-        self.interface_id = None
 
-        self.tshark = None
-        self.nmap = shutil.which("nmap")
+        self.tshark_path = None
+
+        self.nmap_path = shutil.which("nmap")
+
+        self.capture_interface = None
+
+        self.capture_process = None
+
+        self.capture_thread = None
 
         self.running = False
-        self.process = None
 
         self.lock = threading.Lock()
 
-        self.activities = deque(maxlen=1500)
+        # Recent network activity.
+        self.activities = deque(
+            maxlen=2000
+        )
 
+        # Discovered LAN devices.
+        #
+        # IP -> information
         self.devices = {}
 
-        self.stats = defaultdict(
+        # Source IP statistics.
+        #
+        # IP -> {
+        #   domains: set(),
+        #   connections: int,
+        #   last_seen: str
+        # }
+        self.statistics = defaultdict(
             lambda: {
                 "domains": set(),
                 "connections": 0,
-                "last": "-"
+                "last_seen": "-"
             }
         )
 
-        # destination IP -> (domain, timestamp)
+        # DNS cache:
+        #
+        # destination IP ->
+        # (
+        #   domain,
+        #   timestamp
+        # )
         self.dns_cache = {}
 
-        # Optional source-IP filter
-        self.device_filter = None
+        # Optional source IP filter.
+        self.source_filter = None
 
 
     # ========================================================
-    # NETWORK DETECTION
+    # LOCAL NETWORK
     # ========================================================
 
     def detect_local_network(self):
 
+        """
+        Find the preferred local IPv4 address.
+
+        This does not send application data.
+        """
+
         try:
 
-            s = socket.socket(
+            sock = socket.socket(
                 socket.AF_INET,
                 socket.SOCK_DGRAM
             )
 
-            s.connect(("1.1.1.1", 53))
+            sock.connect(
+                (
+                    "1.1.1.1",
+                    53
+                )
+            )
 
-            self.local_ip = s.getsockname()[0]
+            self.local_ipv4 = (
+                sock.getsockname()[0]
+            )
 
-            s.close()
+            sock.close()
 
         except OSError:
+
             pass
 
 
-        for name, addresses in psutil.net_if_addrs().items():
+        # Find OS interface corresponding
+        # to the local IPv4.
+        for interface_name, addresses in (
+            psutil.net_if_addrs().items()
+        ):
 
             for address in addresses:
 
-                if address.address == self.local_ip:
+                if address.family == socket.AF_INET:
 
-                    self.interface_name = name
+                    if address.address == self.local_ipv4:
 
-                    return
+                        self.interface_name = (
+                            interface_name
+                        )
+
+                        return
 
 
     # ========================================================
-    # TSHARK
+    # FIND TSHARK
     # ========================================================
 
     def find_tshark(self):
 
-        self.tshark = shutil.which("tshark")
+        self.tshark_path = shutil.which(
+            "tshark"
+        )
 
-        if self.tshark:
+
+        if self.tshark_path:
+
             return True
 
 
+        # Windows common locations.
         candidates = [
+
             r"C:\Program Files\Wireshark\tshark.exe",
+
             r"C:\Program Files (x86)\Wireshark\tshark.exe",
+
         ]
 
 
         for path in candidates:
 
-            if os.path.exists(path):
+            if os.path.isfile(path):
 
-                self.tshark = path
+                self.tshark_path = path
 
                 return True
 
@@ -167,22 +270,47 @@ class Monitor:
         return False
 
 
-    def list_capture_interfaces(self):
+    # ========================================================
+    # TSHARK INTERFACES
+    # ========================================================
 
-        if not self.tshark:
+    def list_tshark_interfaces(self):
+
+        if not self.tshark_path:
+
             return []
 
 
         try:
 
-            output = subprocess.check_output(
-                [self.tshark, "-D"],
-                stderr=subprocess.STDOUT,
+            result = subprocess.run(
+
+                [
+                    self.tshark_path,
+                    "-D"
+                ],
+
+                stdout=subprocess.PIPE,
+
+                stderr=subprocess.PIPE,
+
                 text=True,
-                timeout=10
+
+                encoding="utf-8",
+
+                errors="replace",
+
+                timeout=15
+
             )
 
-        except Exception:
+
+        except Exception as exc:
+
+            print(
+                f"{Fore.RED}"
+                f"[-] Không chạy được tshark -D: {exc}"
+            )
 
             return []
 
@@ -190,19 +318,36 @@ class Monitor:
         interfaces = []
 
 
-        for line in output.splitlines():
+        for line in result.stdout.splitlines():
 
+            line = line.strip()
+
+
+            if not line:
+
+                continue
+
+
+            # Typical:
+            #
+            # 1. \Device\NPF_{...} (Wi-Fi 3)
+            #
             match = re.match(
-                r"\s*(\d+)\.\s+(.*)",
-                line.strip()
+                r"^(\d+)\.\s+(.*)$",
+                line
             )
+
 
             if match:
 
+                number = match.group(1)
+
+                description = match.group(2)
+
                 interfaces.append(
                     (
-                        match.group(1),
-                        match.group(2)
+                        number,
+                        description
                     )
                 )
 
@@ -210,153 +355,257 @@ class Monitor:
         return interfaces
 
 
-    def choose_interface(self):
+    def choose_capture_interface(self):
 
-        interfaces = self.list_capture_interfaces()
+        interfaces = (
+            self.list_tshark_interfaces()
+        )
 
 
         if not interfaces:
 
+            print(
+                f"{Fore.RED}"
+                "[-] TShark không trả về interface nào."
+            )
+
+            print(
+                "    Hãy kiểm tra Npcap/Wireshark."
+            )
+
             return False
 
 
-        # Try to match the interface detected by psutil
-        if self.interface_name:
-
-            needle = self.interface_name.lower()
-
-            for interface_id, description in interfaces:
-
-                if needle in description.lower():
-
-                    self.interface_id = interface_id
-
-                    return True
-
-
-        # Only one interface
-        if len(interfaces) == 1:
-
-            self.interface_id = interfaces[0][0]
-            self.interface_name = interfaces[0][1]
-
-            return True
-
+        print()
 
         print(
-            f"\n{Fore.YELLOW}"
-            "Capture interfaces:"
+            f"{Fore.CYAN}"
+            "================ CAPTURE INTERFACES ================"
         )
 
 
-        for interface_id, description in interfaces:
+        for number, description in interfaces:
+
+            marker = ""
+
+            if (
+                self.interface_name
+                and self.interface_name.lower()
+                in description.lower()
+            ):
+
+                marker = "  <-- detected by OS"
+
 
             print(
-                f"  [{interface_id}] {description}"
+                f"  [{number}] "
+                f"{description}"
+                f"{marker}"
             )
 
 
+        # Try automatic match first.
+        if self.interface_name:
+
+            needle = (
+                self.interface_name
+                .lower()
+                .strip()
+            )
+
+
+            for number, description in interfaces:
+
+                if needle in description.lower():
+
+                    answer = input(
+                        f"\nDùng [{number}] "
+                        f"{description}? [Y/n]: "
+                    ).strip().lower()
+
+
+                    if answer in (
+                        "",
+                        "y",
+                        "yes"
+                    ):
+
+                        self.capture_interface = number
+
+                        print(
+                            f"{Fore.GREEN}"
+                            f"[+] Selected interface "
+                            f"[{number}]"
+                        )
+
+                        return True
+
+
+        print()
+
         choice = input(
-            "\nChọn interface TShark "
-            "(Enter = interface đầu tiên): "
+            "Nhập số interface muốn capture "
+            "(ví dụ 1): "
         ).strip()
 
 
         if not choice:
 
-            choice = interfaces[0][0]
+            print(
+                f"{Fore.YELLOW}"
+                "[!] Không chọn interface."
+            )
+
+            return False
 
 
-        for interface_id, description in interfaces:
+        for number, description in interfaces:
 
-            if interface_id == choice:
+            if number == choice:
 
-                self.interface_id = interface_id
-                self.interface_name = description
+                self.capture_interface = number
+
+                print(
+                    f"{Fore.GREEN}"
+                    f"[+] Selected [{number}] "
+                    f"{description}"
+                )
 
                 return True
 
+
+        print(
+            f"{Fore.RED}"
+            "[-] Interface không hợp lệ."
+        )
 
         return False
 
 
     # ========================================================
-    # NMAP DISCOVERY
+    # NMAP NETWORK
     # ========================================================
 
-    def subnet(self):
+    def get_ipv4_subnet(self):
 
-        parts = self.local_ip.split(".")
-
-
-        if len(parts) == 4:
-
-            return (
-                f"{parts[0]}."
-                f"{parts[1]}."
-                f"{parts[2]}.0/24"
-            )
+        parts = self.local_ipv4.split(".")
 
 
-        return None
+        if len(parts) != 4:
+
+            return None
 
 
-    def discover(self):
+        return (
+            f"{parts[0]}."
+            f"{parts[1]}."
+            f"{parts[2]}."
+            f"0/24"
+        )
 
-        if not self.nmap:
+
+    def discover_devices(self):
+
+        if not self.nmap_path:
 
             print(
                 f"{Fore.YELLOW}"
-                "[!] Nmap chưa có trong PATH."
+                "[!] Không tìm thấy Nmap trong PATH."
             )
 
             return
 
 
-        network = self.subnet()
+        subnet = (
+            self.get_ipv4_subnet()
+        )
 
 
-        if not network:
+        if not subnet:
+
+            print(
+                f"{Fore.YELLOW}"
+                "[!] Không xác định được IPv4 subnet."
+            )
 
             return
 
 
+        print()
+
         print(
             f"{Fore.CYAN}"
-            f"[*] Nmap discovery: {network}"
+            f"[*] Nmap discovery: {subnet}"
         )
 
 
         try:
 
-            output = subprocess.check_output(
+            result = subprocess.run(
+
                 [
-                    self.nmap,
+                    self.nmap_path,
+
                     "-sn",
-                    network
+
+                    subnet
                 ],
-                stderr=subprocess.STDOUT,
+
+                stdout=subprocess.PIPE,
+
+                stderr=subprocess.PIPE,
+
                 text=True,
-                timeout=30
+
+                encoding="utf-8",
+
+                errors="replace",
+
+                timeout=60
             )
 
-        except Exception as exc:
+
+        except subprocess.TimeoutExpired:
 
             print(
                 f"{Fore.YELLOW}"
-                f"[!] Nmap discovery lỗi: {exc}"
+                "[!] Nmap timeout."
             )
 
             return
 
 
+        except Exception as exc:
+
+            print(
+                f"{Fore.RED}"
+                f"[-] Nmap error: {exc}"
+            )
+
+            return
+
+
+        output = result.stdout
+
+
         current_ip = None
-        current_host = "Unknown"
+
+        current_hostname = "Unknown"
+
+
+        found = 0
 
 
         for line in output.splitlines():
 
-            match = re.search(
+            line = line.strip()
+
+
+            # ----------------------------------------------
+            # Nmap scan report
+            # ----------------------------------------------
+
+            match = re.match(
                 r"Nmap scan report for (.+)",
                 line
             )
@@ -364,28 +613,98 @@ class Monitor:
 
             if match:
 
-                value = match.group(1).strip()
+                value = (
+                    match.group(1)
+                    .strip()
+                )
 
 
-                ip_match = re.search(
-                    r"(\d+\.\d+\.\d+\.\d+)$",
+                # Example:
+                #
+                # hostname (192.168.1.10)
+                #
+                hostname_match = re.match(
+                    r"(.+?)\s+\((\d+\.\d+\.\d+\.\d+)\)$",
                     value
                 )
 
 
-                if ip_match:
+                if hostname_match:
 
-                    current_ip = ip_match.group(1)
+                    current_hostname = (
+                        hostname_match.group(1)
+                    )
+
+                    current_ip = (
+                        hostname_match.group(2)
+                    )
+
 
                 else:
 
-                    current_ip = value
+                    # Example:
+                    #
+                    # 192.168.1.10
+                    #
+                    ip_match = re.search(
+                        r"(\d+\.\d+\.\d+\.\d+)",
+                        value
+                    )
 
 
-                current_host = value
+                    if ip_match:
+
+                        current_ip = (
+                            ip_match.group(1)
+                        )
+
+                        current_hostname = (
+                            value
+                        )
+
+                    else:
+
+                        current_ip = None
+
+                        current_hostname = (
+                            value
+                        )
+
+
+                # IMPORTANT:
+                # Save device immediately.
+                #
+                # We do NOT wait for MAC Address.
+                if current_ip:
+
+                    self.devices[
+                        current_ip
+                    ] = {
+
+                        "hostname":
+                            current_hostname,
+
+                        "mac":
+                            "",
+
+                        "vendor":
+                            "",
+
+                        "last_seen":
+                            datetime.now().strftime(
+                                "%H:%M:%S"
+                            )
+                    }
+
+                    found += 1
+
 
                 continue
 
+
+            # ----------------------------------------------
+            # MAC Address
+            # ----------------------------------------------
 
             match = re.search(
                 r"MAC Address:\s+"
@@ -395,40 +714,71 @@ class Monitor:
             )
 
 
-            if match and current_ip:
+            if (
+                match
+                and current_ip
+                and current_ip in self.devices
+            ):
 
-                self.devices[current_ip] = {
-
-                    "hostname": current_host,
-
-                    "mac": match.group(1),
-
-                    "vendor": match.group(2) or "",
-
-                    "last_seen":
-                        datetime.now().strftime("%H:%M:%S")
-                }
+                self.devices[
+                    current_ip
+                ]["mac"] = (
+                    match.group(1)
+                )
 
 
-                current_ip = None
+                self.devices[
+                    current_ip
+                ]["vendor"] = (
+                    match.group(2)
+                    or ""
+                )
 
+
+        print()
 
         print(
             f"{Fore.GREEN}"
-            f"[+] Found {len(self.devices)} LAN devices."
+            f"[+] Nmap found "
+            f"{len(self.devices)} device(s)."
         )
 
 
+        if result.stderr.strip():
+
+            # Only display short useful errors.
+            stderr_text = (
+                result.stderr.strip()
+            )
+
+            if stderr_text:
+
+                print(
+                    f"{Fore.YELLOW}"
+                    f"[Nmap] {stderr_text[:500]}"
+                )
+
+
     # ========================================================
-    # DOMAIN HANDLING
+    # DOMAIN CLEANING
     # ========================================================
 
     @staticmethod
     def clean_domain(value):
 
+        if value is None:
+
+            return None
+
+
+        value = str(value)
+
         value = (
-            value or ""
-        ).strip().lower().rstrip(".")
+            value
+            .strip()
+            .lower()
+            .rstrip(".")
+        )
 
 
         if not value:
@@ -436,10 +786,11 @@ class Monitor:
             return None
 
 
-        if value in {
+        if value in (
             "-",
-            "unknown"
-        }:
+            "unknown",
+            "none"
+        ):
 
             return None
 
@@ -447,26 +798,19 @@ class Monitor:
         return value
 
 
-    @staticmethod
-    def split_fields(line):
-
-        # TShark fields are tab separated.
-        return line.rstrip(
-            "\r\n"
-        ).split("\t")
-
-
     # ========================================================
-    # DNS CORRELATION
+    # DNS CACHE
     # ========================================================
 
-    def add_dns_cache(
+    def add_dns_mapping(
         self,
         domain,
-        ips
+        ip_addresses
     ):
 
-        domain = self.clean_domain(domain)
+        domain = (
+            self.clean_domain(domain)
+        )
 
 
         if not domain:
@@ -477,22 +821,32 @@ class Monitor:
         now = time.time()
 
 
-        for ip in ips:
+        for ip in ip_addresses:
 
             ip = ip.strip()
 
 
-            if ip:
+            if not ip:
 
-                self.dns_cache[ip] = (
-                    domain,
-                    now
-                )
+                continue
 
 
-    def resolve_from_cache(self, ip):
+            self.dns_cache[
+                ip
+            ] = (
+                domain,
+                now
+            )
 
-        item = self.dns_cache.get(ip)
+
+    def lookup_cached_domain(
+        self,
+        destination_ip
+    ):
+
+        item = self.dns_cache.get(
+            destination_ip
+        )
 
 
         if not item:
@@ -503,12 +857,14 @@ class Monitor:
         domain, timestamp = item
 
 
-        # DNS correlation lifetime:
-        # 5 minutes.
-        if time.time() - timestamp > 300:
+        # DNS mapping expires after 5 minutes.
+        if (
+            time.time() - timestamp
+            > 300
+        ):
 
             self.dns_cache.pop(
-                ip,
+                destination_ip,
                 None
             )
 
@@ -519,40 +875,46 @@ class Monitor:
 
 
     # ========================================================
-    # ACTIVITY RECORDING
+    # RECORD ACTIVITY
     # ========================================================
 
-    def record(
+    def record_activity(
         self,
-        src,
-        dst,
+        source_ip,
+        destination_ip,
         domain,
         protocol,
         port,
-        source
+        source_type
     ):
 
-        if not src or not dst:
+        if not source_ip:
 
             return
 
 
-        # Ignore broadcast / multicast noise.
-        if dst.startswith(
-            (
-                "224.",
-                "239.",
-                "255."
-            )
+        if not destination_ip:
+
+            return
+
+
+        # Optional filter.
+        if (
+            self.source_filter
+            and source_ip
+            != self.source_filter
         ):
 
             return
 
 
-        # Optional source filter.
-        if (
-            self.device_filter
-            and src != self.device_filter
+        # Ignore IPv4 broadcast/multicast.
+        if destination_ip.startswith(
+            (
+                "224.",
+                "239.",
+                "255."
+            )
         ):
 
             return
@@ -565,13 +927,20 @@ class Monitor:
 
 
         activity = Activity(
+
             timestamp,
-            src,
-            dst,
+
+            source_ip,
+
+            destination_ip,
+
             domain,
+
             protocol,
+
             port,
-            source
+
+            source_type
         )
 
 
@@ -582,34 +951,51 @@ class Monitor:
             )
 
 
-            stats = self.stats[src]
+            statistics = (
+                self.statistics[
+                    source_ip
+                ]
+            )
 
-            stats["connections"] += 1
 
-            stats["last"] = timestamp
+            statistics[
+                "connections"
+            ] += 1
+
+
+            statistics[
+                "last_seen"
+            ] = timestamp
 
 
             if domain:
 
-                stats["domains"].add(
+                statistics[
+                    "domains"
+                ].add(
                     domain
                 )
 
 
     # ========================================================
-    # LIVE TSHARK CAPTURE
+    # TSHARK CAPTURE
     # ========================================================
 
     def capture_worker(self):
 
-        # Observe:
-        #
-        # DNS
-        # TLS ClientHello / SNI
-        # QUIC
-        # TCP SYN
-        #
-        # Both IPv4 and IPv6 fields are included.
+        """
+        Capture metadata from the selected interface.
+
+        Filters:
+            DNS
+            TLS ClientHello / SNI
+            QUIC
+            TCP SYN
+            UDP/443
+
+        Both IPv4 and IPv6 are supported.
+        """
+
 
         display_filter = (
             "dns or "
@@ -624,32 +1010,38 @@ class Monitor:
 
             "frame.time_epoch",
 
+            # IPv4
             "ip.src",
             "ip.dst",
 
+            # IPv6
             "ipv6.src",
             "ipv6.dst",
 
+            # Ports
             "tcp.dstport",
             "udp.dstport",
 
+            # DNS
             "dns.flags.response",
             "dns.qry.name",
             "dns.a",
             "dns.aaaa",
 
+            # TLS SNI
             "tls.handshake.extensions_server_name",
 
+            # Protocol
             "_ws.col.Protocol",
         ]
 
 
         command = [
 
-            self.tshark,
+            self.tshark_path,
 
             "-i",
-            self.interface_id,
+            self.capture_interface,
 
             "-l",
 
@@ -659,33 +1051,63 @@ class Monitor:
             display_filter,
 
             "-T",
-            "fields"
+            "fields",
+
+            "-E",
+            "separator=\t",
+
+            "-E",
+            "quote=n",
+
+            "-E",
+            "occurrence=a"
         ]
 
 
         for field in fields:
 
-            command += [
-                "-e",
-                field
-            ]
+            command.extend(
+                [
+                    "-e",
+                    field
+                ]
+            )
+
+
+        print()
+
+        print(
+            f"{Fore.CYAN}"
+            "[*] Starting TShark..."
+        )
+
+
+        print(
+            f"{Fore.CYAN}"
+            f"[*] Command interface: "
+            f"{self.capture_interface}"
+        )
 
 
         try:
 
-            self.process = subprocess.Popen(
+            self.capture_process = (
+                subprocess.Popen(
 
-                command,
+                    command,
 
-                stdout=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
 
-                stderr=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
 
-                text=True,
+                    text=True,
 
-                bufsize=1,
+                    encoding="utf-8",
 
-                errors="replace"
+                    errors="replace",
+
+                    bufsize=1
+                )
             )
 
 
@@ -693,8 +1115,8 @@ class Monitor:
 
             print(
                 f"{Fore.RED}"
-                f"[-] Không thể khởi động TShark: "
-                f"{exc}"
+                f"[-] Không thể start TShark:"
+                f" {exc}"
             )
 
             self.running = False
@@ -702,41 +1124,102 @@ class Monitor:
             return
 
 
+        print(
+            f"{Fore.GREEN}"
+            "[+] TShark capture running."
+        )
+
+
+        # ----------------------------------------------------
+        # Read stderr in background.
+        # ----------------------------------------------------
+
+        def read_errors():
+
+            try:
+
+                for error_line in (
+                    self.capture_process.stderr
+                ):
+
+                    error_line = (
+                        error_line.strip()
+                    )
+
+
+                    if error_line:
+
+                        print(
+                            f"{Fore.YELLOW}"
+                            f"[TShark] "
+                            f"{error_line}"
+                        )
+
+            except Exception:
+
+                pass
+
+
+        threading.Thread(
+            target=read_errors,
+            daemon=True
+        ).start()
+
+
+        # ----------------------------------------------------
+        # Main packet processing loop.
+        # ----------------------------------------------------
+
         while self.running:
 
             line = (
-                self.process.stdout.readline()
+                self.capture_process
+                .stdout
+                .readline()
             )
 
 
             if not line:
 
                 if (
-                    self.process.poll()
+                    self.capture_process
+                    .poll()
                     is not None
                 ):
 
+                    print(
+                        f"{Fore.YELLOW}"
+                        "[!] TShark stopped."
+                    )
+
                     break
+
+
+                time.sleep(0.01)
 
                 continue
 
 
-            parts = self.split_fields(line)
+            parts = (
+                line
+                .rstrip("\r\n")
+                .split("\t")
+            )
 
 
-            if len(parts) < len(fields):
+            # We expect 13 fields.
+            if len(parts) < 13:
 
-                parts += [
-                    ""
-                ] * (
-                    len(fields)
-                    - len(parts)
+                parts.extend(
+                    [""] *
+                    (
+                        13 - len(parts)
+                    )
                 )
 
 
             (
-
-                _timestamp,
+                frame_time,
 
                 ipv4_src,
                 ipv4_dst,
@@ -763,16 +1246,16 @@ class Monitor:
 
 
             # ------------------------------------------------
-            # IPv4 OR IPv6
+            # Select IPv4 OR IPv6.
             # ------------------------------------------------
 
-            src = (
+            source_ip = (
                 ipv4_src
                 or ipv6_src
             )
 
 
-            dst = (
+            destination_ip = (
                 ipv4_dst
                 or ipv6_dst
             )
@@ -793,41 +1276,43 @@ class Monitor:
                 and dns_name
             ):
 
-                ips = []
+                addresses = []
 
 
                 if dns_a:
 
-                    ips.extend(
-                        x
-                        for x in dns_a.split(",")
-                        if x
+                    addresses.extend(
+                        dns_a.split(",")
                     )
 
 
                 if dns_aaaa:
 
-                    ips.extend(
-                        x
-                        for x in dns_aaaa.split(",")
-                        if x
+                    addresses.extend(
+                        dns_aaaa.split(",")
                     )
 
 
-                self.add_dns_cache(
+                self.add_dns_mapping(
                     dns_name,
-                    ips
+                    addresses
                 )
 
 
-                self.record(
-                    src,
-                    dst,
+                self.record_activity(
+
+                    source_ip,
+
+                    destination_ip,
+
                     self.clean_domain(
                         dns_name
                     ),
+
                     "DNS",
+
                     port,
+
                     "DNS"
                 )
 
@@ -844,14 +1329,20 @@ class Monitor:
                 and dns_response != "1"
             ):
 
-                self.record(
-                    src,
-                    dst,
+                self.record_activity(
+
+                    source_ip,
+
+                    destination_ip,
+
                     self.clean_domain(
                         dns_name
                     ),
+
                     "DNS",
+
                     port,
+
                     "DNS"
                 )
 
@@ -863,19 +1354,27 @@ class Monitor:
             # TLS SNI
             # ------------------------------------------------
 
-            domain = self.clean_domain(
-                tls_sni
+            sni_domain = (
+                self.clean_domain(
+                    tls_sni
+                )
             )
 
 
-            if domain:
+            if sni_domain:
 
-                self.record(
-                    src,
-                    dst,
-                    domain,
+                self.record_activity(
+
+                    source_ip,
+
+                    destination_ip,
+
+                    sni_domain,
+
                     protocol or "TLS",
+
                     port,
+
                     "TLS-SNI"
                 )
 
@@ -884,116 +1383,119 @@ class Monitor:
 
 
             # ------------------------------------------------
-            # IP CONNECTION + DNS CORRELATION
+            # IP + DNS CACHE
             # ------------------------------------------------
 
-            if dst:
+            if destination_ip:
 
-                domain = (
-                    self.resolve_from_cache(
-                        dst
+                cached_domain = (
+                    self.lookup_cached_domain(
+                        destination_ip
                     )
                 )
 
 
-                if domain:
+                if cached_domain:
 
-                    self.record(
-                        src,
-                        dst,
-                        domain,
+                    self.record_activity(
+
+                        source_ip,
+
+                        destination_ip,
+
+                        cached_domain,
+
                         protocol or "TCP/UDP",
+
                         port,
-                        "DNS-cache"
+
+                        "DNS-CACHE"
                     )
 
 
+        # ----------------------------------------------------
+        # Cleanup.
+        # ----------------------------------------------------
+
         try:
 
-            self.process.terminate()
+            self.capture_process.terminate()
 
         except Exception:
 
             pass
 
 
-        self.process = None
+        self.capture_process = None
+
+
+        print(
+            f"{Fore.YELLOW}"
+            "[*] Capture worker exited."
+        )
 
 
     # ========================================================
-    # START / STOP
+    # START CAPTURE
     # ========================================================
 
-    def start(self):
+    def start_capture(self):
 
         if self.running:
 
             print(
                 f"{Fore.YELLOW}"
-                "[!] Capture đang chạy."
+                "[!] Capture đã chạy."
             )
 
             return
 
 
-        if not self.tshark:
+        if not self.capture_interface:
 
-            print(
-                f"{Fore.RED}"
-                "[-] Không tìm thấy TShark."
-            )
+            if not self.choose_capture_interface():
 
-            return
-
-
-        if (
-            not self.interface_id
-            and not self.choose_interface()
-        ):
-
-            print(
-                f"{Fore.RED}"
-                "[-] Không chọn được capture interface."
-            )
-
-            return
+                return
 
 
         self.running = True
 
 
-        thread = threading.Thread(
+        self.capture_thread = threading.Thread(
+
             target=self.capture_worker,
+
             daemon=True
         )
 
 
-        thread.start()
+        self.capture_thread.start()
 
 
-        print(
-            f"{Fore.GREEN}"
-            "[+] Capture started"
-        )
+    # ========================================================
+    # STOP CAPTURE
+    # ========================================================
 
+    def stop_capture(self):
 
-        print(
-            f"    Interface: "
-            f"[{self.interface_id}] "
-            f"{self.interface_name}"
-        )
+        if not self.running:
 
+            print(
+                f"{Fore.YELLOW}"
+                "[!] Capture không chạy."
+            )
 
-    def stop(self):
+            return
+
 
         self.running = False
 
 
-        if self.process:
+        if self.capture_process:
 
             try:
 
-                self.process.terminate()
+                self.capture_process.terminate()
 
             except Exception:
 
@@ -1002,112 +1504,35 @@ class Monitor:
 
         print(
             f"{Fore.YELLOW}"
-            "[*] Monitoring stopped."
+            "[*] Capture stopped."
         )
 
 
     # ========================================================
-    # DISPLAY
+    # RECENT ACTIVITY
     # ========================================================
 
-    def print_activity(
+    def show_recent_activity(
         self,
-        limit=40
+        limit=50
     ):
 
         with self.lock:
 
-            rows = list(
+            activities = list(
                 self.activities
             )[:limit]
 
 
+        print()
+
         print(
-            f"\n{Fore.CYAN}"
-            f"{'TIME':8} "
-            f"{'SOURCE':18} "
-            f"{'DESTINATION':42} "
-            f"{'DOMAIN':38} "
-            f"{'SOURCE TYPE':12}"
+            f"{Fore.CYAN}"
+            "================ RECENT ACTIVITY ================"
         )
 
 
-        print(
-            "-" * 125
-        )
-
-
-        for activity in rows:
-
-            destination = (
-                f"{activity.dst}:"
-                f"{activity.port}"
-                if activity.port != "-"
-                else activity.dst
-            )
-
-
-            print(
-                f"{activity.timestamp:8} "
-                f"{activity.src:18} "
-                f"{destination:42.42} "
-                f"{activity.domain:38.38} "
-                f"{activity.source:12}"
-            )
-
-
-    def print_devices(self):
-
-        print(
-            f"\n{Fore.CYAN}"
-            "DISCOVERED LAN DEVICES"
-        )
-
-
-        print("-" * 90)
-
-
-        if not self.devices:
-
-            print(
-                "No devices discovered yet."
-            )
-
-
-        for ip, info in sorted(
-            self.devices.items()
-        ):
-
-            print(
-                f"{ip:16} "
-                f"{info['hostname'][:28]:28} "
-                f"{info['mac']:18} "
-                f"{info['vendor']}"
-            )
-
-
-    def print_summary(self):
-
-        print(
-            f"\n{Fore.CYAN}"
-            "DOMAIN ACTIVITY BY SOURCE"
-        )
-
-
-        print("-" * 100)
-
-
-        with self.lock:
-
-            items = sorted(
-                self.stats.items(),
-                key=lambda item:
-                    item[1]["connections"],
-                reverse=True
-            )
-
-
-        if not items:
+        if not activities:
 
             print(
                 "Chưa có activity."
@@ -1116,25 +1541,92 @@ class Monitor:
             return
 
 
-        for ip, stats in items:
+        print(
+            f"{'TIME':8} "
+            f"{'SOURCE':18} "
+            f"{'DESTINATION':42} "
+            f"{'DOMAIN':42} "
+            f"{'TYPE':10}"
+        )
 
-            domains = ", ".join(
-                sorted(
-                    stats["domains"]
-                )
+
+        print(
+            "-" * 135
+        )
+
+
+        for activity in activities:
+
+            destination = (
+                activity.destination_ip
             )
 
 
-            if not domains:
+            if activity.port != "-":
 
-                domains = (
-                    "(no domain observed)"
+                destination += (
+                    ":"
+                    + activity.port
                 )
 
 
             print(
-                f"\n{Fore.GREEN}"
-                f"{ip}"
+
+                f"{activity.timestamp:8} "
+
+                f"{activity.source_ip:18} "
+
+                f"{destination:42.42} "
+
+                f"{activity.domain:42.42} "
+
+                f"{activity.source_type:10}"
+            )
+
+
+    # ========================================================
+    # DOMAIN SUMMARY
+    # ========================================================
+
+    def show_domain_summary(self):
+
+        with self.lock:
+
+            entries = sorted(
+
+                self.statistics.items(),
+
+                key=lambda item:
+                    item[1]["connections"],
+
+                reverse=True
+            )
+
+
+        print()
+
+        print(
+            f"{Fore.CYAN}"
+            "================ DOMAINS BY PC ================"
+        )
+
+
+        if not entries:
+
+            print(
+                "Chưa quan sát được domain."
+            )
+
+            return
+
+
+        for source_ip, stats in entries:
+
+            print()
+
+            print(
+                f"{Fore.GREEN}"
+                f"{source_ip}"
             )
 
 
@@ -1146,22 +1638,120 @@ class Monitor:
 
             print(
                 f"  Last seen: "
-                f"{stats['last']}"
+                f"{stats['last_seen']}"
             )
+
+
+            domains = sorted(
+                stats["domains"]
+            )
+
+
+            if not domains:
+
+                print(
+                    "  Domains: -"
+                )
+
+                continue
 
 
             print(
-                f"  Domains:"
+                "  Domains:"
             )
 
 
-            for domain in sorted(
-                stats["domains"]
-            ):
+            for domain in domains:
 
                 print(
                     f"    - {domain}"
                 )
+
+
+    # ========================================================
+    # DEVICES
+    # ========================================================
+
+    def show_devices(self):
+
+        print()
+
+        print(
+            f"{Fore.CYAN}"
+            "================ LAN DEVICES ================"
+        )
+
+
+        if not self.devices:
+
+            print(
+                "Chưa có device."
+            )
+
+            return
+
+
+        print(
+            f"{'IP':16} "
+            f"{'HOSTNAME':30} "
+            f"{'MAC':20} "
+            f"{'VENDOR':25} "
+            f"{'SEEN':10}"
+        )
+
+
+        print(
+            "-" * 110
+        )
+
+
+        for ip, info in sorted(
+            self.devices.items()
+        ):
+
+            print(
+
+                f"{ip:16} "
+
+                f"{info['hostname'][:30]:30} "
+
+                f"{info['mac'] or '-':20} "
+
+                f"{info['vendor'][:25]:25} "
+
+                f"{info['last_seen']:10}"
+            )
+
+
+    # ========================================================
+    # FILTER
+    # ========================================================
+
+    def set_source_filter(self):
+
+        value = input(
+            "\nSource IP "
+            "(Enter = all): "
+        ).strip()
+
+
+        if value:
+
+            self.source_filter = value
+
+            print(
+                f"{Fore.GREEN}"
+                f"[+] Filter = {value}"
+            )
+
+        else:
+
+            self.source_filter = None
+
+            print(
+                f"{Fore.GREEN}"
+                "[+] Filter disabled."
+            )
 
 
     # ========================================================
@@ -1174,9 +1764,15 @@ class Monitor:
 
             self.activities.clear()
 
-            self.stats.clear()
+            self.statistics.clear()
 
             self.dns_cache.clear()
+
+
+        print(
+            f"{Fore.GREEN}"
+            "[+] Activity cleared."
+        )
 
 
 # ============================================================
@@ -1192,13 +1788,85 @@ def clear_screen():
     )
 
 
+def print_header(
+    monitor
+):
+
+    print(
+        f"{Fore.CYAN}"
+        "=============================================================="
+    )
+
+
+    print(
+        f"{Fore.CYAN}"
+        "                 LAN DOMAIN MONITOR"
+    )
+
+
+    print(
+        f"{Fore.CYAN}"
+        "=============================================================="
+    )
+
+
+    print(
+        f"Local IPv4 : "
+        f"{monitor.local_ipv4}"
+    )
+
+
+    print(
+        f"OS Interface : "
+        f"{monitor.interface_name or 'Unknown'}"
+    )
+
+
+    print(
+        f"TShark : "
+        f"{monitor.tshark_path or 'Not found'}"
+    )
+
+
+    print(
+        f"Nmap : "
+        f"{monitor.nmap_path or 'Not found'}"
+    )
+
+
+    print()
+
+
+    print(
+        f"{Fore.YELLOW}"
+        "Metadata only:"
+    )
+
+
+    print(
+        "  DNS / TLS SNI / IP / port / protocol"
+    )
+
+
+    print(
+        "  HTTPS payload is NOT decrypted."
+    )
+
+
+    print()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
 
-    monitor = Monitor()
+    monitor = NetworkMonitor()
 
 
     # --------------------------------------------------------
-    # Detect network
+    # Detect local network.
     # --------------------------------------------------------
 
     monitor.detect_local_network()
@@ -1207,71 +1875,25 @@ def main():
     clear_screen()
 
 
-    print(
-        f"{Fore.CYAN}"
-        "=============================================================="
+    print_header(
+        monitor
     )
-
-
-    print(
-        f"{Fore.CYAN}"
-        "          LAN DOMAIN MONITOR"
-    )
-
-
-    print(
-        f"{Fore.CYAN}"
-        "=============================================================="
-    )
-
-
-    print(
-        f"Local IP : "
-        f"{monitor.local_ip}"
-    )
-
-
-    print(
-        f"Interface: "
-        f"{monitor.interface_name or 'unknown'}"
-    )
-
-
-    print()
-
-
-    print(
-        "Network metadata only."
-    )
-
-
-    print(
-        "HTTPS payloads are not decrypted."
-    )
-
-
-    print(
-        "Use only on an authorized lab/network."
-    )
-
-
-    print()
 
 
     # --------------------------------------------------------
-    # TShark
+    # TShark.
     # --------------------------------------------------------
 
     if not monitor.find_tshark():
 
         print(
             f"{Fore.RED}"
-            "[-] TShark not found."
+            "[-] Không tìm thấy TShark."
         )
 
 
         print(
-            "Install Wireshark with TShark first."
+            "Cài Wireshark + Npcap trước."
         )
 
 
@@ -1286,22 +1908,24 @@ def main():
     print(
         f"{Fore.GREEN}"
         f"[+] TShark: "
-        f"{monitor.tshark}"
+        f"{monitor.tshark_path}"
     )
 
 
     # --------------------------------------------------------
-    # Nmap
+    # Nmap discovery.
     # --------------------------------------------------------
 
-    monitor.discover()
+    monitor.discover_devices()
 
 
     # --------------------------------------------------------
-    # Capture interface
+    # Interface.
     # --------------------------------------------------------
 
-    if not monitor.choose_interface():
+    if not monitor.choose_capture_interface():
+
+        print()
 
         print(
             f"{Fore.RED}"
@@ -1318,22 +1942,21 @@ def main():
 
 
     # ========================================================
-    # MAIN LOOP
+    # MENU
     # ========================================================
 
     while True:
 
         print()
 
-
         print(
             f"{Fore.CYAN}"
-            "================ MENU ================"
+            "==================== MENU ===================="
         )
 
 
         print(
-            "[1] Start live domain monitoring"
+            "[1] Start live monitoring"
         )
 
 
@@ -1343,22 +1966,22 @@ def main():
 
 
         print(
-            "[3] Show recent activity"
+            "[3] Recent network activity"
         )
 
 
         print(
-            "[4] Show domains by PC/IP"
+            "[4] Domains by PC/IP"
         )
 
 
         print(
-            "[5] Show discovered LAN devices"
+            "[5] LAN devices"
         )
 
 
         print(
-            "[6] Filter by source IP"
+            "[6] Filter source IP"
         )
 
 
@@ -1368,7 +1991,12 @@ def main():
 
 
         print(
-            "[8] Re-run Nmap discovery"
+            "[8] Refresh Nmap"
+        )
+
+
+        print(
+            "[9] Re-select capture interface"
         )
 
 
@@ -1388,7 +2016,7 @@ def main():
 
         if choice == "1":
 
-            monitor.start()
+            monitor.start_capture()
 
 
         # ----------------------------------------------------
@@ -1397,7 +2025,7 @@ def main():
 
         elif choice == "2":
 
-            monitor.stop()
+            monitor.stop_capture()
 
 
         # ----------------------------------------------------
@@ -1408,7 +2036,7 @@ def main():
 
             clear_screen()
 
-            monitor.print_activity()
+            monitor.show_recent_activity()
 
             input(
                 "\nEnter..."
@@ -1416,14 +2044,14 @@ def main():
 
 
         # ----------------------------------------------------
-        # SUMMARY
+        # DOMAINS
         # ----------------------------------------------------
 
         elif choice == "4":
 
             clear_screen()
 
-            monitor.print_summary()
+            monitor.show_domain_summary()
 
             input(
                 "\nEnter..."
@@ -1438,7 +2066,7 @@ def main():
 
             clear_screen()
 
-            monitor.print_devices()
+            monitor.show_devices()
 
             input(
                 "\nEnter..."
@@ -1451,24 +2079,7 @@ def main():
 
         elif choice == "6":
 
-            value = input(
-                "Source IP "
-                "(Enter = all): "
-            ).strip()
-
-
-            monitor.device_filter = (
-                value
-                if value
-                else None
-            )
-
-
-            print(
-                f"{Fore.GREEN}"
-                "Filter: "
-                f"{monitor.device_filter or 'ALL'}"
-            )
+            monitor.set_source_filter()
 
 
         # ----------------------------------------------------
@@ -1480,19 +2091,33 @@ def main():
             monitor.clear_activity()
 
 
-            print(
-                f"{Fore.GREEN}"
-                "[+] Activity cleared."
-            )
-
-
         # ----------------------------------------------------
         # NMAP REFRESH
         # ----------------------------------------------------
 
         elif choice == "8":
 
-            monitor.discover()
+            monitor.discover_devices()
+
+
+        # ----------------------------------------------------
+        # RESELECT INTERFACE
+        # ----------------------------------------------------
+
+        elif choice == "9":
+
+            if monitor.running:
+
+                print(
+                    f"{Fore.YELLOW}"
+                    "[!] Hãy stop monitoring trước."
+                )
+
+            else:
+
+                monitor.capture_interface = None
+
+                monitor.choose_capture_interface()
 
 
         # ----------------------------------------------------
@@ -1501,7 +2126,7 @@ def main():
 
         elif choice == "0":
 
-            monitor.stop()
+            monitor.stop_capture()
 
             break
 
@@ -1510,7 +2135,7 @@ def main():
 
             print(
                 f"{Fore.YELLOW}"
-                "Unknown option."
+                "[!] Lựa chọn không hợp lệ."
             )
 
 
@@ -1526,6 +2151,37 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
+        print()
+
         print(
-            "\nStopped."
+            f"{Fore.YELLOW}"
+            "[*] Stopped by user."
+        )
+
+    except Exception as exc:
+
+        print()
+
+        print(
+            f"{Fore.RED}"
+            "================================================"
+        )
+
+        print(
+            f"{Fore.RED}"
+            "FATAL ERROR"
+        )
+
+        print(
+            f"{Fore.RED}"
+            f"{exc}"
+        )
+
+        print(
+            f"{Fore.RED}"
+            "================================================"
+        )
+
+        input(
+            "\nEnter để thoát..."
         )
